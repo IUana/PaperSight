@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 
 import streamlit as st
 
@@ -11,10 +11,14 @@ def render_citations(citations: list[dict]) -> None:
         return
 
     for citation in citations:
-        st.markdown(
+        doc_type = citation.get("doc_type", "text")
+        line = (
             f"**[{citation['label']}]** `{citation.get('title', '')}` | "
-            f"page {citation.get('page')} | chunk `{citation.get('chunk_id')}`"
+            f"type `{doc_type}` | page {citation.get('page')} | chunk `{citation.get('chunk_id')}`"
         )
+        if doc_type == "figure":
+            line += f" | figure `{citation.get('figure_id')}` | conf `{citation.get('confidence')}`"
+        st.markdown(line)
         st.caption(citation.get("snippet", ""))
 
 
@@ -31,7 +35,7 @@ def init_state() -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="PaperSight", page_icon="📚", layout="wide")
+    st.set_page_config(page_title="PaperSight", page_icon="📎", layout="wide")
     init_state()
     service = get_service()
 
@@ -40,6 +44,7 @@ def main() -> None:
         st.caption("RAG 学术论文精读助手")
         st.write(f"生成模型：`{service.settings.chat_model}`")
         st.write(f"嵌入模型：`{service.settings.embedding_model}`")
+        st.write(f"视觉模型：`{service.settings.vision_model}`")
 
         uploaded_files = st.file_uploader(
             "上传 PDF 论文",

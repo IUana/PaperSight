@@ -1,4 +1,4 @@
-from io import BytesIO
+﻿from io import BytesIO
 from pathlib import Path
 from shutil import rmtree
 from uuid import uuid4
@@ -7,6 +7,7 @@ import pytest
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+from papersight.core.pdf_loader import ExtractedFigure, ParsedPdfContent
 from papersight.core.service import PaperSightService
 from papersight.core.settings import PaperSightSettings
 
@@ -56,14 +57,28 @@ class FakeVectorIndex:
         return ranked[:k]
 
 
-def make_service(tmp_path, parser):
+class FakeFigureAnalyzer:
+    def analyze(self, image_bytes: bytes, mime_type: str, caption: str | None = None):
+        return {
+            "figure_type": "pipeline",
+            "is_pipeline": True,
+            "confidence": 0.9,
+            "steps": ["Encode input", "Aggregate features", "Predict output"],
+            "components": ["Encoder", "Aggregator", "Head"],
+            "relations": ["Encoder -> Aggregator", "Aggregator -> Head"],
+            "summary": caption or "Pipeline diagram with three stages.",
+        }
+
+
+def make_service(tmp_path, parser, figure_analyzer=None):
     settings = PaperSightSettings(data_dir=tmp_path, chunk_size=30, chunk_overlap=10)
     splitter = RecursiveCharacterTextSplitter(chunk_size=30, chunk_overlap=10, separators=[""])
     return PaperSightService(
         settings=settings,
         vector_index=FakeVectorIndex(),
-        llm=FakeLLM("测试回答 [C1]"),
+        llm=FakeLLM("test answer [C1]"),
         pdf_parser=parser,
+        figure_analyzer=figure_analyzer,
         splitter=splitter,
     )
 
@@ -165,3 +180,90 @@ def test_answer_contract_contains_expected_fields(workdir):
     assert "used_chunks" in result
     assert result["citations"]
     assert {"paper_id", "page", "chunk_id", "snippet"}.issubset(result["citations"][0].keys())
+
+
+def test_ingest_adds_text_and_figure_chunks(workdir):
+    def parser(_: bytes):
+        return ParsedPdfContent(
+            pages=[(1, "Method section explains the approach.")],
+            figures=[
+                ExtractedFigure(
+                    page=1,
+                    figure_id="p1_f1",
+                    image_bytes=b"fake-image",
+                    mime_type="image/png",
+                    caption="Figure 1: Proposed pipeline.",
+                )
+            ],
+        )
+
+    service = make_service(workdir, parser, figure_analyzer=FakeFigureAnalyzer())
+    upload = BytesIO(b"hybrid")
+    upload.name = "hybrid.pdf"
+
+    result = service.ingest_document(upload, title="Hybrid")
+
+    assert result["added_text_chunks"] > 0
+    assert result["added_figure_chunks"] == 1
+    assert result["added_chunks"] == result["added_text_chunks"] + result["added_figure_chunks"]
+
+
+def test_pipeline_question_prefers_figure_citation(workdir):
+    def parser(_: bytes):
+        return ParsedPdfContent(
+            pages=[(1, "This paper introduces a method for image classification.")],
+            figures=[
+                ExtractedFigure(
+                    page=1,
+                    figure_id="p1_f1",
+                    image_bytes=b"fake-image",
+                    mime_type="image/png",
+                    caption="Figure 1: End-to-end pipeline.",
+                )
+            ],
+        )
+
+    service = make_service(workdir, parser, figure_analyzer=FakeFigureAnalyzer())
+    upload = BytesIO(b"pipeline-doc")
+    upload.name = "pipeline.pdf"
+    service.ingest_document(upload, title="Pipeline")
+
+    result = service.answer_question("pipeline", scope_mode="global", top_k=1)
+
+    assert result["citations"]
+    assert result["citations"][0]["doc_type"] == "figure"
+    assert result["citations"][0]["figure_id"] == "p1_f1"
+
+
+def test_figure_backfill_is_idempotent(workdir):
+    def text_parser(_: bytes):
+        return [(1, "text only baseline")]
+
+    service = make_service(workdir, text_parser, figure_analyzer=FakeFigureAnalyzer())
+    upload = BytesIO(b"legacy")
+    upload.name = "legacy.pdf"
+    paper_id = service.ingest_document(upload, title="Legacy")["paper_id"]
+
+    def parser_with_figure(_: bytes):
+        return ParsedPdfContent(
+            pages=[(1, "text only baseline")],
+            figures=[
+                ExtractedFigure(
+                    page=1,
+                    figure_id="p1_f1",
+                    image_bytes=b"fake-image",
+                    mime_type="image/png",
+                    caption="Figure 1: Legacy pipeline.",
+                )
+            ],
+        )
+
+    service.pdf_parser = parser_with_figure
+    first = service.backfill_figure_chunks()
+    second = service.backfill_figure_chunks()
+
+    paper = service.catalog.get_paper(paper_id)
+    assert first["added_figure_chunks"] == 1
+    assert second["added_figure_chunks"] == 0
+    assert paper is not None
+    assert paper["figure_chunk_count"] == 1

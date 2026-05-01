@@ -41,3 +41,14 @@ class CatalogStore:
         data["papers"][paper_id] = paper
         data["hash_to_paper_id"][content_hash] = paper_id
         self._write(data)
+
+    def update_paper(self, paper_id: str, updates: dict[str, Any]) -> dict[str, Any] | None:
+        data = self._read()
+        paper = data["papers"].get(paper_id)
+        if paper is None:
+            return None
+
+        paper.update(updates)
+        data["papers"][paper_id] = paper
+        self._write(data)
+        return paper

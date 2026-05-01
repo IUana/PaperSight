@@ -1,5 +1,6 @@
-import hashlib
+﻿import hashlib
 import re
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,10 +11,16 @@ from langchain_ollama import ChatOllama
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from papersight.core.catalog import CatalogStore
-from papersight.core.pdf_loader import extract_pages_from_pdf, normalize_text
+from papersight.core.pdf_loader import (
+    ExtractedFigure,
+    ParsedPdfContent,
+    extract_pdf_content,
+    normalize_text,
+)
 from papersight.core.prompts import build_qa_prompt, build_report_prompt
 from papersight.core.settings import PaperSightSettings
 from papersight.core.vector_index import FaissVectorIndex
+from papersight.core.vision import FigureAnalysis, OllamaFigureAnalyzer
 
 
 class PaperSightService:
@@ -46,14 +53,40 @@ class PaperSightService:
         "and",
         "or",
     }
-    ZH_STOPWORDS = {"什么", "如何", "怎么", "为何", "为什么", "请问", "介绍", "一下", "一下子", "是否", "可以"}
+    ZH_STOPWORDS = {
+        "什么",
+        "如何",
+        "怎么",
+        "为何",
+        "为什么",
+        "请问",
+        "介绍",
+        "一个",
+        "一下",
+        "是否",
+        "可以",
+    }
+    PIPELINE_HINTS = {
+        "pipeline",
+        "workflow",
+        "framework",
+        "architecture",
+        "diagram",
+        "flowchart",
+        "流程",
+        "步骤",
+        "框架",
+        "管线",
+        "架构图",
+    }
 
     def __init__(
         self,
         settings: PaperSightSettings | None = None,
         vector_index: Any | None = None,
         llm: Any | None = None,
-        pdf_parser: Callable[[bytes], list[tuple[int, str]]] | None = None,
+        pdf_parser: Callable[[bytes], list[tuple[int, str]] | ParsedPdfContent] | None = None,
+        figure_analyzer: Any | None = None,
         splitter: RecursiveCharacterTextSplitter | None = None,
     ) -> None:
         self.settings = settings or PaperSightSettings()
@@ -68,11 +101,21 @@ class PaperSightService:
         index_dir = self.data_dir / self.settings.index_dir_name
         self.vector_index = vector_index or FaissVectorIndex(index_dir, self.settings.embedding_model)
         self.llm = llm or ChatOllama(model=self.settings.chat_model, temperature=0)
-        self.pdf_parser = pdf_parser or extract_pages_from_pdf
+        self.pdf_parser = pdf_parser or self._default_pdf_parser
+
+        self.figure_analyzer = figure_analyzer
+        if self.figure_analyzer is None and self.settings.enable_figure_parsing:
+            self.figure_analyzer = OllamaFigureAnalyzer(self.settings.vision_model)
+
         self.splitter = splitter or RecursiveCharacterTextSplitter(
             chunk_size=self.settings.chunk_size,
             chunk_overlap=self.settings.chunk_overlap,
         )
+
+        self._backfill_marker = self.data_dir / ".figure_backfill.done"
+        self._backfill_started = False
+        self._backfill_lock = threading.Lock()
+        self._start_background_backfill()
 
     def list_papers(self) -> list[dict[str, Any]]:
         return self.catalog.list_papers()
@@ -80,7 +123,14 @@ class PaperSightService:
     def ingest_document(self, file: Any, title: str | None = None) -> dict[str, Any]:
         raw_bytes, original_name = self._read_upload(file)
         if not raw_bytes:
-            return {"paper_id": None, "added_chunks": 0, "deduplicated": False, "message": "上传文件为空。"}
+            return {
+                "paper_id": None,
+                "added_chunks": 0,
+                "added_text_chunks": 0,
+                "added_figure_chunks": 0,
+                "deduplicated": False,
+                "message": "上传文件为空。",
+            }
 
         content_hash = hashlib.sha256(raw_bytes).hexdigest()
         existing = self.catalog.get_paper_by_hash(content_hash)
@@ -88,17 +138,25 @@ class PaperSightService:
             return {
                 "paper_id": existing["paper_id"],
                 "added_chunks": 0,
+                "added_text_chunks": 0,
+                "added_figure_chunks": 0,
                 "deduplicated": True,
                 "message": f"文档已存在：{existing['title']}",
             }
 
-        pages = self.pdf_parser(raw_bytes)
-        if not any(text.strip() for _, text in pages):
+        parsed = self._normalize_pdf_parse_result(self.pdf_parser(raw_bytes))
+        pages = parsed.pages
+        figures = parsed.figures if self.settings.enable_figure_parsing else []
+
+        has_text = any(text.strip() for _, text in pages)
+        if not has_text and not figures:
             return {
                 "paper_id": None,
                 "added_chunks": 0,
+                "added_text_chunks": 0,
+                "added_figure_chunks": 0,
                 "deduplicated": False,
-                "message": "文本提取不足：该PDF可能是扫描件或无可解析文本。",
+                "message": "文本与图像均未提取到有效内容。",
             }
 
         paper_id = f"paper_{uuid.uuid4().hex[:10]}"
@@ -106,19 +164,33 @@ class PaperSightService:
         source_path = self.upload_dir / f"{paper_id}.pdf"
         source_path.write_bytes(raw_bytes)
 
-        documents = self._chunk_pages(
+        text_documents = self._chunk_pages(
             pages=pages,
             paper_id=paper_id,
             title=safe_title,
             source_path=str(source_path),
             content_hash=content_hash,
         )
+
+        figure_documents: list[Document] = []
+        if figures and self.figure_analyzer is not None:
+            figure_documents = self._chunk_figures(
+                figures=figures,
+                paper_id=paper_id,
+                title=safe_title,
+                source_path=str(source_path),
+                content_hash=content_hash,
+            )
+
+        documents = text_documents + figure_documents
         if not documents:
             return {
                 "paper_id": None,
                 "added_chunks": 0,
+                "added_text_chunks": 0,
+                "added_figure_chunks": 0,
                 "deduplicated": False,
-                "message": "文档分块失败：未得到可用文本块。",
+                "message": "文档分块失败：未得到可用内容。",
             }
 
         self.vector_index.add_documents(documents)
@@ -130,14 +202,19 @@ class PaperSightService:
             "content_hash": content_hash,
             "page_count": len(pages),
             "chunk_count": len(documents),
+            "text_chunk_count": len(text_documents),
+            "figure_chunk_count": len(figure_documents),
+            "figure_count": len(figures),
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         self.catalog.add_paper(paper_record, content_hash)
         return {
             "paper_id": paper_id,
             "added_chunks": len(documents),
+            "added_text_chunks": len(text_documents),
+            "added_figure_chunks": len(figure_documents),
             "deduplicated": False,
-            "message": f"入库成功：{safe_title}（{len(documents)} chunks）",
+            "message": f"入库成功：{safe_title}（text={len(text_documents)}, figure={len(figure_documents)}）",
         }
 
     def answer_question(
@@ -157,22 +234,43 @@ class PaperSightService:
         if scope_mode == "paper" and paper_id:
             metadata_filter = {"paper_id": paper_id}
 
+        prefers_pipeline = self._is_pipeline_question(normalized_question)
         candidate_k = max(top_k, self.settings.retrieval_candidate_k)
         fetch_k = max(candidate_k, self.settings.retrieval_fetch_k)
-        results = self.vector_index.similarity_search(
+
+        semantic_results = self.vector_index.similarity_search(
             query=normalized_question,
             k=candidate_k,
             metadata_filter=metadata_filter,
             fetch_k=fetch_k,
         )
+
+        if prefers_pipeline:
+            figure_query = f"{normalized_question} pipeline workflow diagram"
+            semantic_results += self.vector_index.similarity_search(
+                query=figure_query,
+                k=candidate_k,
+                metadata_filter=metadata_filter,
+                fetch_k=fetch_k,
+            )
+
         keyword_results = self._keyword_search_candidates(
             question=normalized_question,
             metadata_filter=metadata_filter,
             limit=candidate_k,
         )
-        merged_results = self._merge_results(results, keyword_results, max_items=max(candidate_k * 2, 40))
+        merged_results = self._merge_results(
+            semantic_results,
+            keyword_results,
+            max_items=max(candidate_k * 2, 40),
+        )
 
-        selected = self._rerank_results(normalized_question, merged_results, top_k)
+        selected = self._rerank_results(
+            normalized_question,
+            merged_results,
+            top_k,
+            prefer_pipeline=prefers_pipeline,
+        )
         if not selected:
             return {"answer": self.settings.fallback_answer, "citations": [], "used_chunks": 0}
 
@@ -190,7 +288,7 @@ class PaperSightService:
                 "summary_meta": {"paper_id": paper_id, "used_chunks": 0},
             }
 
-        report_query = "research question method experiment setup results limitations reproducibility"
+        report_query = "research question method experiment setup results limitations reproducibility pipeline"
         results = self.vector_index.similarity_search(
             query=report_query,
             k=12,
@@ -212,6 +310,94 @@ class PaperSightService:
             "citations": citations,
             "summary_meta": {"paper_id": paper_id, "title": paper["title"], "used_chunks": len(citations)},
         }
+
+    def backfill_figure_chunks(self) -> dict[str, int]:
+        if not self.settings.enable_figure_parsing or self.figure_analyzer is None:
+            return {"papers_scanned": 0, "papers_updated": 0, "added_figure_chunks": 0}
+
+        stats = {"papers_scanned": 0, "papers_updated": 0, "added_figure_chunks": 0}
+        papers = self.catalog.list_papers()
+
+        for paper in papers:
+            stats["papers_scanned"] += 1
+            paper_id = str(paper.get("paper_id") or "")
+            source_path_str = str(paper.get("source_path") or "")
+            if not paper_id or not source_path_str:
+                continue
+
+            source_path = Path(source_path_str)
+            if not source_path.exists():
+                continue
+
+            existing_figure_chunks = int(paper.get("figure_chunk_count", 0) or 0)
+            if existing_figure_chunks > 0:
+                continue
+
+            try:
+                raw_bytes = source_path.read_bytes()
+                parsed = self._normalize_pdf_parse_result(self.pdf_parser(raw_bytes))
+            except Exception:
+                continue
+
+            existing_chunk_ids = self._existing_chunk_ids_for_paper(paper_id)
+            figure_docs = self._chunk_figures(
+                figures=parsed.figures,
+                paper_id=paper_id,
+                title=str(paper.get("title") or paper_id),
+                source_path=source_path_str,
+                content_hash=str(paper.get("content_hash") or ""),
+                existing_chunk_ids=existing_chunk_ids,
+            )
+            if figure_docs:
+                self.vector_index.add_documents(figure_docs)
+
+            text_count = int(paper.get("text_chunk_count", paper.get("chunk_count", 0)) or 0)
+            self.catalog.update_paper(
+                paper_id,
+                {
+                    "text_chunk_count": text_count,
+                    "figure_chunk_count": len(figure_docs),
+                    "figure_count": len(parsed.figures),
+                    "chunk_count": text_count + len(figure_docs),
+                    "figure_backfilled_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            stats["papers_updated"] += 1
+            stats["added_figure_chunks"] += len(figure_docs)
+
+        return stats
+
+    def _start_background_backfill(self) -> None:
+        if not self.settings.enable_figure_parsing or self.figure_analyzer is None:
+            return
+        if self._backfill_marker.exists():
+            return
+
+        with self._backfill_lock:
+            if self._backfill_started:
+                return
+            self._backfill_started = True
+
+        worker = threading.Thread(target=self._run_background_backfill, daemon=True)
+        worker.start()
+
+    def _run_background_backfill(self) -> None:
+        try:
+            self.backfill_figure_chunks()
+            timestamp = datetime.now(timezone.utc).isoformat()
+            self._backfill_marker.write_text(timestamp, encoding="utf-8")
+        except Exception:
+            pass
+
+    def _default_pdf_parser(self, pdf_bytes: bytes) -> ParsedPdfContent:
+        return extract_pdf_content(pdf_bytes, max_figures_per_page=self.settings.max_figures_per_page)
+
+    def _normalize_pdf_parse_result(self, parsed: list[tuple[int, str]] | ParsedPdfContent) -> ParsedPdfContent:
+        if isinstance(parsed, ParsedPdfContent):
+            return parsed
+        if isinstance(parsed, list):
+            return ParsedPdfContent(pages=parsed, figures=[])
+        raise TypeError("Unsupported parse result type.")
 
     def _read_upload(self, file: Any) -> tuple[bytes, str]:
         if isinstance(file, (bytes, bytearray)):
@@ -253,16 +439,117 @@ class PaperSightService:
                         "source_path": source_path,
                         "page": page_no,
                         "content_hash": content_hash,
+                        "doc_type": "text",
                     }
                 ],
             )
 
             for doc in page_docs:
-                doc.metadata["chunk_id"] = f"{paper_id}_c{chunk_seq}"
+                doc.metadata["chunk_id"] = f"{paper_id}_t{chunk_seq}"
                 docs.append(doc)
                 chunk_seq += 1
 
         return docs
+
+    def _chunk_figures(
+        self,
+        figures: list[ExtractedFigure],
+        paper_id: str,
+        title: str,
+        source_path: str,
+        content_hash: str,
+        existing_chunk_ids: set[str] | None = None,
+    ) -> list[Document]:
+        docs: list[Document] = []
+        skip_ids = existing_chunk_ids or set()
+
+        for figure in figures:
+            chunk_id = f"{paper_id}_{figure.figure_id}"
+            if chunk_id in skip_ids:
+                continue
+
+            analysis = self._analyze_figure(figure)
+            text = self._build_figure_chunk_text(figure, analysis)
+            metadata = {
+                "paper_id": paper_id,
+                "title": title,
+                "source_path": source_path,
+                "page": figure.page,
+                "content_hash": content_hash,
+                "chunk_id": chunk_id,
+                "doc_type": "figure",
+                "figure_id": figure.figure_id,
+                "figure_type": analysis.figure_type,
+                "is_pipeline": analysis.is_pipeline,
+                "confidence": analysis.confidence,
+                "caption": figure.caption,
+            }
+            docs.append(Document(page_content=text, metadata=metadata))
+
+        return docs
+
+    def _analyze_figure(self, figure: ExtractedFigure) -> FigureAnalysis:
+        if self.figure_analyzer is None:
+            return FigureAnalysis(
+                figure_type="other",
+                is_pipeline=False,
+                confidence=0.0,
+                steps=[],
+                components=[],
+                relations=[],
+                summary=figure.caption or "图像解析不可用。",
+            )
+
+        result = self.figure_analyzer.analyze(
+            image_bytes=figure.image_bytes,
+            mime_type=figure.mime_type,
+            caption=figure.caption,
+        )
+
+        if isinstance(result, FigureAnalysis):
+            return result
+
+        if isinstance(result, dict):
+            return FigureAnalysis(
+                figure_type=str(result.get("figure_type", "other")),
+                is_pipeline=bool(result.get("is_pipeline", False)),
+                confidence=self._safe_confidence(result.get("confidence", 0.0)),
+                steps=self._normalize_string_list(result.get("steps")),
+                components=self._normalize_string_list(result.get("components")),
+                relations=self._normalize_string_list(result.get("relations")),
+                summary=str(result.get("summary", figure.caption or "图像解析返回为空。")),
+            )
+
+        return FigureAnalysis(
+            figure_type="other",
+            is_pipeline=False,
+            confidence=0.0,
+            steps=[],
+            components=[],
+            relations=[],
+            summary=figure.caption or "图像解析返回不可识别。",
+        )
+
+    def _build_figure_chunk_text(self, figure: ExtractedFigure, analysis: FigureAnalysis) -> str:
+        lines = [
+            "Figure Analysis",
+            f"Figure ID: {figure.figure_id}",
+            f"Type: {analysis.figure_type}",
+            f"Pipeline: {analysis.is_pipeline}",
+            f"Confidence: {analysis.confidence:.2f}",
+            f"Summary: {analysis.summary}",
+        ]
+
+        if figure.caption:
+            lines.append(f"Caption: {figure.caption}")
+        if analysis.steps:
+            lines.append("Steps: " + " | ".join(analysis.steps))
+        if analysis.components:
+            lines.append("Components: " + " | ".join(analysis.components))
+        if analysis.relations:
+            lines.append("Relations: " + " | ".join(analysis.relations))
+
+        return "\n".join(lines)
 
     def _build_context(self, results: list[tuple[Document, float]]) -> tuple[str, list[dict[str, Any]]]:
         context_lines: list[str] = []
@@ -273,8 +560,10 @@ class PaperSightService:
             metadata = doc.metadata
             label = f"C{idx}"
             context_lines.append(
-                f"[{label}] paper_id={metadata.get('paper_id')} page={metadata.get('page')} "
-                f"chunk_id={metadata.get('chunk_id')}\n{snippet}"
+                f"[{label}] doc_type={metadata.get('doc_type', 'text')} "
+                f"paper_id={metadata.get('paper_id')} page={metadata.get('page')} "
+                f"chunk_id={metadata.get('chunk_id')} figure_id={metadata.get('figure_id')} "
+                f"confidence={metadata.get('confidence')}\n{snippet}"
             )
             citations.append(
                 {
@@ -283,6 +572,9 @@ class PaperSightService:
                     "title": metadata.get("title"),
                     "page": metadata.get("page"),
                     "chunk_id": metadata.get("chunk_id"),
+                    "doc_type": metadata.get("doc_type", "text"),
+                    "figure_id": metadata.get("figure_id"),
+                    "confidence": metadata.get("confidence"),
                     "snippet": snippet[:500],
                     "score": score,
                 }
@@ -313,6 +605,7 @@ class PaperSightService:
         question: str,
         results: list[tuple[Document, float]],
         top_k: int,
+        prefer_pipeline: bool,
     ) -> list[tuple[Document, float]]:
         if not results:
             return []
@@ -328,6 +621,7 @@ class PaperSightService:
         for doc, base_score in results:
             text = doc.page_content or ""
             text_lower = text.lower()
+            metadata = doc.metadata
 
             bonus = 0.0
             if question_lower and len(question_lower) <= 64 and question_lower in text_lower:
@@ -336,8 +630,14 @@ class PaperSightService:
             matched_terms = sum(1 for term in terms if term in text_lower)
             bonus += min(0.07 * matched_terms, 0.35)
 
+            if prefer_pipeline:
+                if metadata.get("doc_type") == "figure":
+                    bonus += 0.25
+                if metadata.get("is_pipeline") is True:
+                    bonus += self.settings.pipeline_figure_boost
+
             penalty = 0.0
-            if not wants_reference and self._looks_like_reference_chunk(text):
+            if not wants_reference and metadata.get("doc_type") != "figure" and self._looks_like_reference_chunk(text):
                 penalty += 0.25
 
             rank_score = base_score - bonus + penalty
@@ -414,10 +714,18 @@ class PaperSightService:
             if hit_count == 0:
                 continue
 
-            page = doc.metadata.get("page")
+            metadata = doc.metadata
+            page = metadata.get("page")
             page_number = int(page) if isinstance(page, int) else 999
             reference_penalty = 0.15 if self._looks_like_reference_chunk(text) else 0.0
-            synthetic_score = 0.95 - min(hit_count, 6) * 0.08 + min(page_number, 60) * 0.001 + reference_penalty
+
+            boost = 0.0
+            if metadata.get("doc_type") == "figure":
+                boost += 0.12
+            if metadata.get("is_pipeline") is True and self._is_pipeline_question(question):
+                boost += self.settings.pipeline_figure_boost
+
+            synthetic_score = 0.95 - min(hit_count, 6) * 0.08 + min(page_number, 60) * 0.001 + reference_penalty - boost
             scored.append((synthetic_score, doc))
 
         scored.sort(key=lambda item: item[0])
@@ -445,3 +753,42 @@ class PaperSightService:
 
         merged_items = sorted(merged.values(), key=lambda item: item[1])
         return merged_items[:max_items]
+
+    def _is_pipeline_question(self, question: str) -> bool:
+        lowered = question.lower()
+        for token in self.PIPELINE_HINTS:
+            if token in lowered or token in question:
+                return True
+        return False
+
+    def _safe_confidence(self, value: Any) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, min(1.0, number))
+
+    def _normalize_string_list(self, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        normalized: list[str] = []
+        for item in value:
+            text = str(item).strip()
+            if text:
+                normalized.append(text)
+        return normalized[:24]
+
+    def _existing_chunk_ids_for_paper(self, paper_id: str) -> set[str]:
+        vectorstore = getattr(self.vector_index, "vectorstore", None)
+        if vectorstore is None:
+            return set()
+
+        chunk_ids: set[str] = set()
+        for doc in vectorstore.docstore._dict.values():
+            metadata = getattr(doc, "metadata", {})
+            if metadata.get("paper_id") != paper_id:
+                continue
+            chunk_id = metadata.get("chunk_id")
+            if isinstance(chunk_id, str) and chunk_id:
+                chunk_ids.add(chunk_id)
+        return chunk_ids

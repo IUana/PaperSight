@@ -42,8 +42,12 @@
       "source_path": "data\\uploads\\paper_58905c9da6.pdf",
       "content_hash": "b0ffafed56bef4937150dcf63ac5379cdc6aeedeac4a83b1af56512d92f9a496",
       "page_count": 42,
-      "chunk_count": 172,
-      "created_at": "2026-05-01T12:38:54.235225+00:00"
+      "chunk_count": 173,
+      "created_at": "2026-05-01T12:38:54.235225+00:00",
+      "text_chunk_count": 172,
+      "figure_chunk_count": 1,
+      "figure_count": 1,
+      "figure_backfilled_at": "2026-05-01T13:45:50.725771+00:00"
     }
   },
   "hash_to_paper_id": {
