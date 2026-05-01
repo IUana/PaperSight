@@ -44,14 +44,14 @@ class FaissVectorIndex:
         query: str,
         k: int,
         metadata_filter: dict[str, str] | None = None,
+        fetch_k: int | None = None,
     ) -> list[tuple[Document, float]]:
         if self.vectorstore is None:
             return []
-        return self.vectorstore.similarity_search_with_score(
-            query=query,
-            k=k,
-            filter=metadata_filter,
-        )
+        kwargs: dict[str, object] = {"query": query, "k": k, "filter": metadata_filter}
+        if fetch_k is not None:
+            kwargs["fetch_k"] = fetch_k
+        return self.vectorstore.similarity_search_with_score(**kwargs)
 
     def save(self) -> None:
         if self.vectorstore is None:

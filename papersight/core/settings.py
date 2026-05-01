@@ -15,4 +15,6 @@ class PaperSightSettings:
     chunk_size: int = 1000
     chunk_overlap: int = 200
     default_top_k: int = 5
+    retrieval_candidate_k: int = 30
+    retrieval_fetch_k: int = 200
     fallback_answer: str = FALLBACK_ANSWER

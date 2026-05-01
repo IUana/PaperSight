@@ -31,7 +31,13 @@ class FakeVectorIndex:
     def add_documents(self, documents: list[Document]) -> None:
         self.docs.extend(documents)
 
-    def similarity_search(self, query: str, k: int, metadata_filter: dict | None = None):
+    def similarity_search(
+        self,
+        query: str,
+        k: int,
+        metadata_filter: dict | None = None,
+        fetch_k: int | None = None,
+    ):
         query_lower = query.lower()
         candidates = self.docs
         if metadata_filter:

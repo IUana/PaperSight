@@ -1,4 +1,5 @@
 import hashlib
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,37 @@ from papersight.core.vector_index import FaissVectorIndex
 
 
 class PaperSightService:
+    EN_STOPWORDS = {
+        "what",
+        "which",
+        "when",
+        "where",
+        "why",
+        "how",
+        "who",
+        "whom",
+        "whose",
+        "is",
+        "are",
+        "was",
+        "were",
+        "do",
+        "does",
+        "did",
+        "a",
+        "an",
+        "the",
+        "of",
+        "to",
+        "for",
+        "in",
+        "on",
+        "at",
+        "and",
+        "or",
+    }
+    ZH_STOPWORDS = {"什么", "如何", "怎么", "为何", "为什么", "请问", "介绍", "一下", "一下子", "是否", "可以"}
+
     def __init__(
         self,
         settings: PaperSightSettings | None = None,
@@ -125,14 +157,22 @@ class PaperSightService:
         if scope_mode == "paper" and paper_id:
             metadata_filter = {"paper_id": paper_id}
 
-        retrieve_k = max(top_k, 20) if metadata_filter else top_k
+        candidate_k = max(top_k, self.settings.retrieval_candidate_k)
+        fetch_k = max(candidate_k, self.settings.retrieval_fetch_k)
         results = self.vector_index.similarity_search(
             query=normalized_question,
-            k=retrieve_k,
+            k=candidate_k,
             metadata_filter=metadata_filter,
+            fetch_k=fetch_k,
         )
+        keyword_results = self._keyword_search_candidates(
+            question=normalized_question,
+            metadata_filter=metadata_filter,
+            limit=candidate_k,
+        )
+        merged_results = self._merge_results(results, keyword_results, max_items=max(candidate_k * 2, 40))
 
-        selected = results[:top_k]
+        selected = self._rerank_results(normalized_question, merged_results, top_k)
         if not selected:
             return {"answer": self.settings.fallback_answer, "citations": [], "used_chunks": 0}
 
@@ -267,3 +307,141 @@ class PaperSightService:
                     collected.append(str(item["text"]))
             return "\n".join(collected)
         return str(result)
+
+    def _rerank_results(
+        self,
+        question: str,
+        results: list[tuple[Document, float]],
+        top_k: int,
+    ) -> list[tuple[Document, float]]:
+        if not results:
+            return []
+
+        question_lower = question.lower()
+        terms = self._extract_query_terms(question)
+        wants_reference = any(
+            token in question_lower
+            for token in ["reference", "references", "citation", "citations", "文献", "引用", "参考"]
+        )
+
+        reranked: list[tuple[float, Document, float]] = []
+        for doc, base_score in results:
+            text = doc.page_content or ""
+            text_lower = text.lower()
+
+            bonus = 0.0
+            if question_lower and len(question_lower) <= 64 and question_lower in text_lower:
+                bonus += 0.40
+
+            matched_terms = sum(1 for term in terms if term in text_lower)
+            bonus += min(0.07 * matched_terms, 0.35)
+
+            penalty = 0.0
+            if not wants_reference and self._looks_like_reference_chunk(text):
+                penalty += 0.25
+
+            rank_score = base_score - bonus + penalty
+            reranked.append((rank_score, doc, base_score))
+
+        reranked.sort(key=lambda item: item[0])
+        return [(doc, base_score) for _, doc, base_score in reranked[:top_k]]
+
+    def _extract_query_terms(self, question: str) -> list[str]:
+        terms: list[str] = []
+        seen: set[str] = set()
+
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}", question.lower()):
+            if token in self.EN_STOPWORDS:
+                continue
+            if token not in seen:
+                seen.add(token)
+                terms.append(token)
+
+        for token in re.findall(r"[\u4e00-\u9fff]{2,}", question):
+            if token in self.ZH_STOPWORDS:
+                continue
+            if token not in seen:
+                seen.add(token)
+                terms.append(token)
+
+        return terms[:16]
+
+    def _looks_like_reference_chunk(self, text: str) -> bool:
+        lower = text.lower()
+        clues = [
+            "references",
+            "bibliography",
+            "doi",
+            "arxiv",
+            "proceedings",
+            "conference on",
+            "et al.",
+            "pp.",
+            "vol.",
+            "isbn",
+        ]
+        clue_hits = sum(1 for clue in clues if clue in lower)
+        bracket_hits = len(re.findall(r"\[[A-Za-z0-9+]{2,}\]", text))
+        return clue_hits >= 2 or bracket_hits >= 3
+
+    def _keyword_search_candidates(
+        self,
+        question: str,
+        metadata_filter: dict[str, str] | None,
+        limit: int,
+    ) -> list[tuple[Document, float]]:
+        vectorstore = getattr(self.vector_index, "vectorstore", None)
+        if vectorstore is None:
+            return []
+
+        terms = self._extract_query_terms(question)
+        if not terms:
+            return []
+
+        docs = list(vectorstore.docstore._dict.values())
+        if metadata_filter:
+            docs = [
+                doc
+                for doc in docs
+                if all(doc.metadata.get(key) == value for key, value in metadata_filter.items())
+            ]
+
+        scored: list[tuple[float, Document]] = []
+        for doc in docs:
+            text = doc.page_content or ""
+            lowered = text.lower()
+            hit_count = sum(lowered.count(term) for term in terms)
+            if hit_count == 0:
+                continue
+
+            page = doc.metadata.get("page")
+            page_number = int(page) if isinstance(page, int) else 999
+            reference_penalty = 0.15 if self._looks_like_reference_chunk(text) else 0.0
+            synthetic_score = 0.95 - min(hit_count, 6) * 0.08 + min(page_number, 60) * 0.001 + reference_penalty
+            scored.append((synthetic_score, doc))
+
+        scored.sort(key=lambda item: item[0])
+        return [(doc, score) for score, doc in scored[:limit]]
+
+    def _merge_results(
+        self,
+        semantic_results: list[tuple[Document, float]],
+        keyword_results: list[tuple[Document, float]],
+        max_items: int,
+    ) -> list[tuple[Document, float]]:
+        merged: dict[str, tuple[Document, float]] = {}
+
+        def make_key(doc: Document) -> str:
+            chunk_id = doc.metadata.get("chunk_id")
+            if isinstance(chunk_id, str):
+                return chunk_id
+            return str(id(doc))
+
+        for doc, score in semantic_results + keyword_results:
+            key = make_key(doc)
+            existing = merged.get(key)
+            if existing is None or score < existing[1]:
+                merged[key] = (doc, score)
+
+        merged_items = sorted(merged.values(), key=lambda item: item[1])
+        return merged_items[:max_items]
