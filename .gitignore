@@ -1,0 +1,13 @@
+.venv/
+env/
+ENV/
+.conda/
+conda-meta/
+__pycache__/
+.pytest_cache/
+*.pyc
+data/faiss_index/
+data/uploads/
+.tmp/
+.ptmp/
+data/test_runs/

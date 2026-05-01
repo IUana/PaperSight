@@ -1,0 +1,18 @@
+from dataclasses import dataclass
+from pathlib import Path
+
+FALLBACK_ANSWER = "无法从给定上下文确定答案。"
+
+
+@dataclass(frozen=True)
+class PaperSightSettings:
+    data_dir: Path = Path("data")
+    index_dir_name: str = "faiss_index"
+    catalog_filename: str = "catalog.json"
+    upload_dir_name: str = "uploads"
+    chat_model: str = "gemma4:e4b"
+    embedding_model: str = "nomic-embed-text"
+    chunk_size: int = 1000
+    chunk_overlap: int = 200
+    default_top_k: int = 5
+    fallback_answer: str = FALLBACK_ANSWER
