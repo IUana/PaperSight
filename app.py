@@ -74,6 +74,42 @@ def main() -> None:
         selected_paper_label = st.selectbox("论文范围", options=list(paper_options.keys()))
         selected_paper_id = paper_options[selected_paper_label]
 
+        st.divider()
+        st.subheader("知识库管理")
+
+        can_delete_selected = selected_paper_id is not None
+        confirm_delete_selected = st.checkbox(
+            "确认删除当前选中论文",
+            disabled=not can_delete_selected,
+            key="confirm_delete_selected",
+        )
+        if st.button(
+            "删除当前选中论文",
+            disabled=not can_delete_selected or not confirm_delete_selected,
+            use_container_width=True,
+        ):
+            result = service.delete_paper(selected_paper_id)
+            if result["deleted"]:
+                st.success(result["message"])
+            else:
+                st.warning(result["message"])
+            st.rerun()
+
+        has_papers = bool(papers)
+        confirm_clear_library = st.checkbox(
+            "确认清空全部论文",
+            disabled=not has_papers,
+            key="confirm_clear_library",
+        )
+        if st.button(
+            "清空全部论文",
+            disabled=not has_papers or not confirm_clear_library,
+            use_container_width=True,
+        ):
+            result = service.clear_library()
+            st.success(result["message"])
+            st.rerun()
+
         scope_mode = st.radio(
             "检索模式",
             options=["global", "paper"],

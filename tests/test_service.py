@@ -32,6 +32,16 @@ class FakeVectorIndex:
     def add_documents(self, documents: list[Document]) -> None:
         self.docs.extend(documents)
 
+    def remove_paper(self, paper_id: str) -> int:
+        before = len(self.docs)
+        self.docs = [doc for doc in self.docs if doc.metadata.get("paper_id") != paper_id]
+        return before - len(self.docs)
+
+    def clear(self) -> int:
+        removed = len(self.docs)
+        self.docs = []
+        return removed
+
     def similarity_search(
         self,
         query: str,
@@ -267,3 +277,83 @@ def test_figure_backfill_is_idempotent(workdir):
     assert second["added_figure_chunks"] == 0
     assert paper is not None
     assert paper["figure_chunk_count"] == 1
+
+
+def test_delete_paper_removes_catalog_vectors_and_file(workdir):
+    def parser(payload: bytes):
+        return [(1, payload.decode("utf-8"))]
+
+    service = make_service(workdir, parser)
+
+    doc_a = BytesIO("alpha method details".encode("utf-8"))
+    doc_a.name = "alpha.pdf"
+    doc_b = BytesIO("beta experiment results".encode("utf-8"))
+    doc_b.name = "beta.pdf"
+
+    paper_a = service.ingest_document(doc_a, title="Alpha")["paper_id"]
+    paper_b = service.ingest_document(doc_b, title="Beta")["paper_id"]
+
+    paper_a_record = service.catalog.get_paper(paper_a)
+    assert paper_a_record is not None
+    source_path = Path(paper_a_record["source_path"])
+    assert source_path.exists()
+
+    result = service.delete_paper(paper_a)
+
+    assert result["deleted"] is True
+    assert result["paper_id"] == paper_a
+    assert result["deleted_chunks"] > 0
+    assert result["deleted_file"] is True
+    assert service.catalog.get_paper(paper_a) is None
+    assert service.catalog.get_paper(paper_b) is not None
+    assert not source_path.exists() or source_path.stat().st_size == 0
+    assert all(doc.metadata.get("paper_id") != paper_a for doc in service.vector_index.docs)
+
+
+def test_delete_missing_paper_is_safe(workdir):
+    def parser(_: bytes):
+        return [(1, "baseline text")]
+
+    service = make_service(workdir, parser)
+    upload = BytesIO(b"baseline-file")
+    upload.name = "baseline.pdf"
+    service.ingest_document(upload, title="Baseline")
+
+    before_count = len(service.list_papers())
+    result = service.delete_paper("paper_not_exists")
+
+    assert result["deleted"] is False
+    assert result["deleted_chunks"] == 0
+    assert result["deleted_file"] is False
+    assert "未找到" in result["message"]
+    assert len(service.list_papers()) == before_count
+
+
+def test_clear_library_removes_all_papers_vectors_and_files(workdir):
+    def parser(payload: bytes):
+        return [(1, payload.decode("utf-8"))]
+
+    service = make_service(workdir, parser)
+
+    doc_a = BytesIO("alpha method details".encode("utf-8"))
+    doc_a.name = "alpha.pdf"
+    doc_b = BytesIO("beta experiment results".encode("utf-8"))
+    doc_b.name = "beta.pdf"
+
+    paper_a = service.ingest_document(doc_a, title="Alpha")["paper_id"]
+    paper_b = service.ingest_document(doc_b, title="Beta")["paper_id"]
+    source_paths = []
+    for paper_id in [paper_a, paper_b]:
+        record = service.catalog.get_paper(paper_id)
+        assert record is not None
+        source_paths.append(Path(record["source_path"]))
+
+    result = service.clear_library()
+
+    assert result["cleared_papers"] == 2
+    assert result["deleted_chunks"] > 0
+    assert result["deleted_files"] == 2
+    assert service.list_papers() == []
+    assert service.vector_index.docs == []
+    for path in source_paths:
+        assert not path.exists() or path.stat().st_size == 0

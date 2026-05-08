@@ -57,3 +57,33 @@ class FaissVectorIndex:
         if self.vectorstore is None:
             return
         self.vectorstore.save_local(str(self.index_dir))
+
+    def remove_paper(self, paper_id: str) -> int:
+        if self.vectorstore is None:
+            return 0
+
+        all_docs = list(self.vectorstore.docstore._dict.values())
+        remaining_docs = [doc for doc in all_docs if doc.metadata.get("paper_id") != paper_id]
+        removed_count = len(all_docs) - len(remaining_docs)
+        if removed_count == 0:
+            return 0
+
+        if not remaining_docs:
+            self.clear()
+            return removed_count
+
+        self.vectorstore = FAISS.from_documents(remaining_docs, self.embeddings)
+        self.save()
+        return removed_count
+
+    def clear(self) -> int:
+        removed_count = 0
+        if self.vectorstore is not None:
+            removed_count = int(self.vectorstore.index.ntotal)
+        self.vectorstore = None
+
+        for path in [self.index_dir / "index.faiss", self.index_dir / "index.pkl"]:
+            if path.exists():
+                path.unlink()
+
+        return removed_count

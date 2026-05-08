@@ -1,60 +1,19 @@
 {
   "papers": {
-    "paper_cf6edb160a": {
-      "paper_id": "paper_cf6edb160a",
-      "title": "AutoDAN",
-      "source_path": "data\\uploads\\paper_cf6edb160a.pdf",
-      "content_hash": "1d6cff474509628c16bc31e219f1c7bfbe0ef61a875f94fda29a784ebf935dae",
-      "page_count": 21,
-      "chunk_count": 106,
-      "created_at": "2026-05-01T12:38:49.545975+00:00"
-    },
-    "paper_e2b0286c7b": {
-      "paper_id": "paper_e2b0286c7b",
-      "title": "AutoDan-Turbo",
-      "source_path": "data\\uploads\\paper_e2b0286c7b.pdf",
-      "content_hash": "214243febc83e4f7e0b23dbe1aac5dabca90ec7c044af15722a545d565aad2a8",
-      "page_count": 48,
-      "chunk_count": 240,
-      "created_at": "2026-05-01T12:38:51.375664+00:00"
-    },
-    "paper_86f7da5831": {
-      "paper_id": "paper_86f7da5831",
-      "title": "GCG-T",
-      "source_path": "data\\uploads\\paper_86f7da5831.pdf",
-      "content_hash": "ab8745c2e3c6dfd939d5a590760bbae4682d92db010947cbb306688ad086bfd1",
-      "page_count": 31,
-      "chunk_count": 118,
-      "created_at": "2026-05-01T12:38:52.204973+00:00"
-    },
-    "paper_745e14548e": {
-      "paper_id": "paper_745e14548e",
-      "title": "PAIR",
-      "source_path": "data\\uploads\\paper_745e14548e.pdf",
-      "content_hash": "590bf40aa58061928f54d01b7d53f0d5141bb2ecf4f01483c6849423934f44e4",
-      "page_count": 34,
-      "chunk_count": 124,
-      "created_at": "2026-05-01T12:38:53.014762+00:00"
-    },
-    "paper_58905c9da6": {
-      "paper_id": "paper_58905c9da6",
-      "title": "TAP",
-      "source_path": "data\\uploads\\paper_58905c9da6.pdf",
-      "content_hash": "b0ffafed56bef4937150dcf63ac5379cdc6aeedeac4a83b1af56512d92f9a496",
-      "page_count": 42,
-      "chunk_count": 173,
-      "created_at": "2026-05-01T12:38:54.235225+00:00",
-      "text_chunk_count": 172,
-      "figure_chunk_count": 1,
-      "figure_count": 1,
-      "figure_backfilled_at": "2026-05-01T13:45:50.725771+00:00"
+    "paper_0c8bdf4b50": {
+      "paper_id": "paper_0c8bdf4b50",
+      "title": "Attention Is All You Need",
+      "source_path": "data\\uploads\\paper_0c8bdf4b50.pdf",
+      "content_hash": "bdfaa68d8984f0dc02beaca527b76f207d99b666d31d1da728ee0728182df697",
+      "page_count": 15,
+      "chunk_count": 55,
+      "text_chunk_count": 52,
+      "figure_chunk_count": 3,
+      "figure_count": 3,
+      "created_at": "2026-05-07T17:20:50.056951+00:00"
     }
   },
   "hash_to_paper_id": {
-    "1d6cff474509628c16bc31e219f1c7bfbe0ef61a875f94fda29a784ebf935dae": "paper_cf6edb160a",
-    "214243febc83e4f7e0b23dbe1aac5dabca90ec7c044af15722a545d565aad2a8": "paper_e2b0286c7b",
-    "ab8745c2e3c6dfd939d5a590760bbae4682d92db010947cbb306688ad086bfd1": "paper_86f7da5831",
-    "590bf40aa58061928f54d01b7d53f0d5141bb2ecf4f01483c6849423934f44e4": "paper_745e14548e",
-    "b0ffafed56bef4937150dcf63ac5379cdc6aeedeac4a83b1af56512d92f9a496": "paper_58905c9da6"
+    "bdfaa68d8984f0dc02beaca527b76f207d99b666d31d1da728ee0728182df697": "paper_0c8bdf4b50"
   }
 }

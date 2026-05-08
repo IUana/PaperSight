@@ -120,6 +120,57 @@ class PaperSightService:
     def list_papers(self) -> list[dict[str, Any]]:
         return self.catalog.list_papers()
 
+    def delete_paper(self, paper_id: str | None) -> dict[str, Any]:
+        normalized_paper_id = (paper_id or "").strip()
+        if not normalized_paper_id:
+            return {
+                "deleted": False,
+                "paper_id": None,
+                "deleted_chunks": 0,
+                "deleted_file": False,
+                "message": "论文 ID 不能为空。",
+            }
+
+        paper = self.catalog.get_paper(normalized_paper_id)
+        if paper is None:
+            return {
+                "deleted": False,
+                "paper_id": normalized_paper_id,
+                "deleted_chunks": 0,
+                "deleted_file": False,
+                "message": "未找到该论文。",
+            }
+
+        deleted_chunks = self.vector_index.remove_paper(normalized_paper_id)
+        self.catalog.remove_paper(normalized_paper_id)
+        deleted_file = self._remove_source_file(str(paper.get("source_path") or ""))
+        title = str(paper.get("title") or normalized_paper_id)
+
+        return {
+            "deleted": True,
+            "paper_id": normalized_paper_id,
+            "deleted_chunks": deleted_chunks,
+            "deleted_file": deleted_file,
+            "message": f"已删除论文：{title}（chunk={deleted_chunks}, file={'yes' if deleted_file else 'no'}）",
+        }
+
+    def clear_library(self) -> dict[str, Any]:
+        papers = self.catalog.list_papers()
+        deleted_files = 0
+        for paper in papers:
+            source_path = str(paper.get("source_path") or "")
+            if self._remove_source_file(source_path):
+                deleted_files += 1
+
+        deleted_chunks = self.vector_index.clear()
+        cleared_papers = self.catalog.clear()
+        return {
+            "cleared_papers": cleared_papers,
+            "deleted_chunks": deleted_chunks,
+            "deleted_files": deleted_files,
+            "message": f"已清空知识库（papers={cleared_papers}, chunks={deleted_chunks}, files={deleted_files}）。",
+        }
+
     def ingest_document(self, file: Any, title: str | None = None) -> dict[str, Any]:
         raw_bytes, original_name = self._read_upload(file)
         if not raw_bytes:
@@ -792,3 +843,22 @@ class PaperSightService:
             if isinstance(chunk_id, str) and chunk_id:
                 chunk_ids.add(chunk_id)
         return chunk_ids
+
+    def _remove_source_file(self, source_path: str) -> bool:
+        if not source_path:
+            return False
+
+        path = Path(source_path)
+        if not path.exists() or not path.is_file():
+            return False
+
+        try:
+            path.unlink()
+            return True
+        except OSError:
+            # In restricted environments unlink may fail; fall back to truncation.
+            try:
+                path.write_bytes(b"")
+            except OSError:
+                return False
+        return True

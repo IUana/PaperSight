@@ -52,3 +52,25 @@ class CatalogStore:
         data["papers"][paper_id] = paper
         self._write(data)
         return paper
+
+    def remove_paper(self, paper_id: str) -> dict[str, Any] | None:
+        data = self._read()
+        paper = data["papers"].pop(paper_id, None)
+        if paper is None:
+            return None
+
+        hash_to_paper_id = data["hash_to_paper_id"]
+        removable_hashes = [content_hash for content_hash, mapped_id in hash_to_paper_id.items() if mapped_id == paper_id]
+        for content_hash in removable_hashes:
+            hash_to_paper_id.pop(content_hash, None)
+
+        self._write(data)
+        return paper
+
+    def clear(self) -> int:
+        data = self._read()
+        removed_count = len(data["papers"])
+        data["papers"] = {}
+        data["hash_to_paper_id"] = {}
+        self._write(data)
+        return removed_count
